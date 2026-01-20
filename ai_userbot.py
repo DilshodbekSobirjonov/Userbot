@@ -1,162 +1,141 @@
 import os
-import asyncio
-import random
 import time
+import random
+import asyncio
 from collections import defaultdict, deque
 
-from telethon import TelegramClient, events
 from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    filters
+)
 
 from openai import OpenAI
 import anthropic
 
-# ================== LOAD ENV ==================
+# ================= ENV =================
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 anthropic_client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY")
 )
 
-# ================== CONSTANTS ==================
+# ================= SETTINGS =================
 AI_TRIGGER = "AI CHAT"
 STOP_TRIGGER = "STOP AI"
 
-INACTIVITY_TIMEOUT = 30 * 60  # 30 minutes
-DELAY_RANGE = (4.5, 7.0)      # seconds
+DELAY_RANGE = (5.0, 7.0)
 MAX_TOKENS = 400
+TIMEOUT = 30 * 60  # 30 min
 
-# ================== STATE ==================
-sessions = {}  # chat_id -> session data
+# ================= STATE =================
+sessions = {}
 queues = defaultdict(deque)
 locks = defaultdict(asyncio.Lock)
 
-# ================== CLIENT ==================
-client = TelegramClient("userbot_session", API_ID, API_HASH)
-
-# ================== AI FUNCTIONS ==================
-
-async def ask_openai(prompt):
-    resp = openai_client.chat.completions.create(
+# ================= AI =================
+async def ask_openai(text):
+    r = openai_client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": text}],
         max_tokens=MAX_TOKENS
     )
-    return resp.choices[0].message.content.strip()
+    return r.choices[0].message.content.strip()
 
-
-async def ask_anthropic(prompt):
-    resp = anthropic_client.messages.create(
+async def ask_anthropic(text):
+    r = anthropic_client.messages.create(
         model="claude-3-haiku-20240307",
         max_tokens=MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": text}]
     )
-    return resp.content[0].text.strip()
+    return r.content[0].text.strip()
 
-# ================== SESSION HELPERS ==================
-
-def activate_session(chat_id):
+# ================= SESSION =================
+def activate(chat_id):
     model = random.choice(["openai", "anthropic"])
     sessions[chat_id] = {
         "model": model,
-        "last_activity": time.time()
+        "last": time.time()
     }
     return model
 
-
-def deactivate_session(chat_id):
+def deactivate(chat_id):
     sessions.pop(chat_id, None)
     queues.pop(chat_id, None)
 
-
-def session_active(chat_id):
+def active(chat_id):
     return chat_id in sessions
 
-
-def update_activity(chat_id):
-    if chat_id in sessions:
-        sessions[chat_id]["last_activity"] = time.time()
-
-# ================== MESSAGE PROCESSOR ==================
-
-async def process_queue(chat_id):
+# ================= QUEUE =================
+async def process(chat_id, context):
     async with locks[chat_id]:
         while queues[chat_id]:
-            text, event = queues[chat_id].popleft()
-
-            delay = random.uniform(*DELAY_RANGE)
-            await asyncio.sleep(delay)
-
-            model = sessions[chat_id]["model"]
+            text = queues[chat_id].popleft()
+            await asyncio.sleep(random.uniform(*DELAY_RANGE))
 
             try:
+                model = sessions[chat_id]["model"]
                 if model == "openai":
-                    answer = await ask_openai(text)
+                    reply = await ask_openai(text)
                 else:
-                    answer = await ask_anthropic(text)
+                    reply = await ask_anthropic(text)
 
-                await event.reply(answer)
+                await context.bot.send_message(chat_id, reply)
 
-            except Exception as e:
-                await event.reply("⚠️ Ошибка AI, попробуй позже.")
+            except Exception:
+                await context.bot.send_message(chat_id, "⚠️ Ошибка AI")
 
-            update_activity(chat_id)
+            sessions[chat_id]["last"] = time.time()
 
-# ================== EVENT HANDLER ==================
+# ================= HANDLER =================
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    chat_id = update.message.chat_id
 
-@client.on(events.NewMessage)
-async def handler(event):
-    if not event.text:
-        return
-
-    chat_id = event.chat_id
-    text = event.text.strip()
-
-    # STOP AI — always priority
     if text.upper() == STOP_TRIGGER:
-        if session_active(chat_id):
-            deactivate_session(chat_id)
-            await event.reply("🛑 AI режим отключён")
+        if active(chat_id):
+            deactivate(chat_id)
+            await update.message.reply_text("🛑 AI режим отключён")
         return
 
-    # ACTIVATE AI
     if text.upper() == AI_TRIGGER:
-        if not session_active(chat_id):
-            model = activate_session(chat_id)
+        if not active(chat_id):
+            model = activate(chat_id)
             name = "ChatGPT" if model == "openai" else "Anthropic AI"
-            await event.reply(
+            await update.message.reply_text(
                 f"🤖 AI режим активирован\n"
                 f"Модель: {name}\n"
-                f"Для выхода напишите: STOP AI"
+                f"Для выхода: STOP AI"
             )
         return
 
-    # NORMAL MESSAGE
-    if session_active(chat_id):
-        update_activity(chat_id)
-        queues[chat_id].append((text, event))
+    if active(chat_id):
+        sessions[chat_id]["last"] = time.time()
+        queues[chat_id].append(text)
         if len(queues[chat_id]) == 1:
-            asyncio.create_task(process_queue(chat_id))
+            asyncio.create_task(process(chat_id, context))
 
-# ================== CLEANUP TASK ==================
-
-async def cleanup_sessions():
+# ================= CLEANER =================
+async def cleaner():
     while True:
         now = time.time()
-        for chat_id in list(sessions.keys()):
-            if now - sessions[chat_id]["last_activity"] > INACTIVITY_TIMEOUT:
-                deactivate_session(chat_id)
+        for cid in list(sessions.keys()):
+            if now - sessions[cid]["last"] > TIMEOUT:
+                deactivate(cid)
         await asyncio.sleep(60)
 
-# ================== MAIN ==================
-
+# ================= MAIN =================
 async def main():
-    await client.start()
-    asyncio.create_task(cleanup_sessions())
-    print("✅ AI userbot запущен")
-    await client.run_until_disconnected()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    asyncio.create_task(cleaner())
+    print("✅ Telegram Business AI Bot запущен")
+    await app.run_polling()
 
-client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    asyncio.run(main())
