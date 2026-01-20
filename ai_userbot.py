@@ -1,13 +1,10 @@
 import os
 import time
-import random
 import asyncio
 from collections import defaultdict, deque
 
-import httpx
 import openai
 from dotenv import load_dotenv
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -21,10 +18,9 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
-    raise RuntimeError("❌ Проверь .env — отсутствуют ключи")
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    raise RuntimeError("❌ Проверь .env файл")
 
 openai.api_key = OPENAI_API_KEY
 
@@ -32,90 +28,106 @@ openai.api_key = OPENAI_API_KEY
 AI_TRIGGER = "AI CHAT"
 STOP_TRIGGER = "STOP AI"
 
-DELAY_RANGE = (5.0, 7.0)   # задержка ответа
 MAX_TOKENS = 400
-TIMEOUT = 30 * 60          # 30 минут
+MEMORY_LIMIT = 6              # сколько сообщений помнить
+SESSION_TIMEOUT = 30 * 60     # 30 минут
+DELAY = (4.5, 6.5)
+
+# 💰 ЛИМИТ РАСХОДОВ (очень грубо, но надёжно)
+MAX_TOKENS_PER_DAY = 8000     # ~ $0.01–0.02 на gpt-3.5
+tokens_used_today = 0
+last_reset_day = time.strftime("%Y-%m-%d")
 
 # ================= STATE =================
-sessions = {}                   # chat_id -> {model, last_activity}
-queues = defaultdict(deque)     # chat_id -> очередь сообщений
+sessions = {}                 # chat_id -> session
+queues = defaultdict(deque)
 locks = defaultdict(asyncio.Lock)
 
+# ================= HELPERS =================
+def reset_daily_limit():
+    global tokens_used_today, last_reset_day
+    today = time.strftime("%Y-%m-%d")
+    if today != last_reset_day:
+        tokens_used_today = 0
+        last_reset_day = today
+
+def estimate_tokens(text: str) -> int:
+    # грубая оценка: 1 токен ~ 4 символа
+    return max(1, len(text) // 4)
+
 # ================= OPENAI =================
-def ask_openai(prompt: str) -> str:
-    response = openai.ChatCompletion.create(
+def ask_openai(messages):
+    global tokens_used_today
+
+    resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_TOKENS
+        messages=messages,
+        max_tokens=MAX_TOKENS,
     )
-    return response.choices[0].message["content"].strip()
 
-# ================= ANTHROPIC (HTTP) =================
-async def ask_anthropic(prompt: str) -> str:
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
+    content = resp.choices[0].message["content"].strip()
 
-    payload = {
-        "model": "claude-3-haiku-20240307",
-        "max_tokens": MAX_TOKENS,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-    }
+    used = estimate_tokens(content)
+    tokens_used_today += used
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["content"][0]["text"].strip()
+    return content
 
 # ================= SESSION =================
-def activate_session(chat_id: int) -> str:
-    model = random.choice(["openai", "anthropic"])
+def activate_session(chat_id):
     sessions[chat_id] = {
-        "model": model,
+        "history": [],
         "last_activity": time.time(),
     }
-    return model
 
-def deactivate_session(chat_id: int):
+def deactivate_session(chat_id):
     sessions.pop(chat_id, None)
     queues.pop(chat_id, None)
 
-def session_active(chat_id: int) -> bool:
+def session_active(chat_id):
     return chat_id in sessions
 
-# ================= QUEUE PROCESSOR =================
-async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+# ================= QUEUE =================
+async def process_queue(chat_id, context):
     async with locks[chat_id]:
         while queues[chat_id]:
             text = queues[chat_id].popleft()
-            await asyncio.sleep(random.uniform(*DELAY_RANGE))
+            await asyncio.sleep(
+                (DELAY[0] + (DELAY[1] - DELAY[0]) * 0.5)
+            )
 
             try:
-                model = sessions[chat_id]["model"]
+                reset_daily_limit()
 
-                if model == "openai":
-                    reply = ask_openai(text)
-                else:
-                    reply = await ask_anthropic(text)
+                if tokens_used_today >= MAX_TOKENS_PER_DAY:
+                    await context.bot.send_message(
+                        chat_id,
+                        "💰 Дневной лимит AI исчерпан. Попробуй завтра."
+                    )
+                    continue
 
-                await context.bot.send_message(chat_id, reply)
+                session = sessions[chat_id]
 
-            except Exception:
+                # формируем контекст
+                messages = [{"role": "system", "content": "Ты полезный и краткий AI помощник."}]
+                messages += session["history"]
+                messages.append({"role": "user", "content": text})
+
+                answer = ask_openai(messages)
+
+                # сохраняем память
+                session["history"].append({"role": "user", "content": text})
+                session["history"].append({"role": "assistant", "content": answer})
+                session["history"] = session["history"][-MEMORY_LIMIT * 2 :]
+
+                await context.bot.send_message(chat_id, answer)
+
+                session["last_activity"] = time.time()
+
+            except Exception as e:
                 await context.bot.send_message(
                     chat_id,
-                    "⚠️ Ошибка AI, попробуйте позже"
+                    f"⚠️ AI ошибка:\n{str(e)}"
                 )
-
-            sessions[chat_id]["last_activity"] = time.time()
 
 # ================= HANDLER =================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -125,38 +137,36 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.message.chat_id
 
-    # STOP AI — приоритет
+    # STOP
     if text.upper() == STOP_TRIGGER:
         if session_active(chat_id):
             deactivate_session(chat_id)
             await update.message.reply_text("🛑 AI режим отключён")
         return
 
-    # AI CHAT — активация
+    # START AI
     if text.upper() == AI_TRIGGER:
         if not session_active(chat_id):
-            model = activate_session(chat_id)
-            name = "ChatGPT" if model == "openai" else "Anthropic AI"
+            activate_session(chat_id)
             await update.message.reply_text(
-                f"🤖 AI режим активирован\n"
-                f"Модель: {name}\n"
-                f"Для выхода напишите: STOP AI"
+                "🤖 AI режим активирован\n"
+                "Память: включена\n"
+                "Лимит: включён\n"
+                "Для выхода: STOP AI"
             )
         return
 
-    # Обычное сообщение
+    # NORMAL MESSAGE
     if session_active(chat_id):
-        sessions[chat_id]["last_activity"] = time.time()
         queues[chat_id].append(text)
-
         if len(queues[chat_id]) == 1:
             asyncio.create_task(process_queue(chat_id, context))
 
-# ================= CLEANUP JOB =================
-async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+# ================= CLEANUP =================
+async def cleanup(context):
     now = time.time()
     for cid in list(sessions.keys()):
-        if now - sessions[cid]["last_activity"] > TIMEOUT:
+        if now - sessions[cid]["last_activity"] > SESSION_TIMEOUT:
             deactivate_session(cid)
 
 # ================= MAIN =================
@@ -167,10 +177,9 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, on_message)
     )
 
-    # каждые 60 сек чистим сессии
-    app.job_queue.run_repeating(cleanup_job, interval=60, first=60)
+    app.job_queue.run_repeating(cleanup, interval=60, first=60)
 
-    print("✅ Telegram Business AI Bot запущен")
+    print("✅ AI Bot запущен (память + лимит)")
     app.run_polling()
 
 if __name__ == "__main__":
