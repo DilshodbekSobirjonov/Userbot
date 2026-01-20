@@ -12,24 +12,25 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-if not BOT_TOKEN or not OPENAI_API_KEY:
+if not BOT_TOKEN or not ANTHROPIC_API_KEY:
     raise RuntimeError("❌ Проверь .env файл")
 
 # ============== SETTINGS ==============
-MODEL_ID = "gpt-4o-mini"
-MODEL_LABEL = "GPT-4o mini"
+MODEL_ID = "claude-3-haiku-20240307"
+MODEL_LABEL = "Claude 3 Haiku"
 SIGNATURE = "by: @elyyxs"
 
-MAX_OUTPUT_TOKENS = 400
+MAX_TOKENS = 400
 MEMORY_LIMIT = 6
 SESSION_TIMEOUT = 30 * 60
 
 DELAY_MIN = 4.5
 DELAY_MAX = 6.5
 
-MAX_TOKENS_PER_DAY = 8000
+# 💰 ЛИМИТ (грубо, но надёжно)
+MAX_TOKENS_PER_DAY = 10000
 tokens_used_today = 0
 last_day = time.strftime("%Y-%m-%d")
 
@@ -63,31 +64,32 @@ def cleanup_sessions():
             sessions.pop(cid, None)
             queues.pop(cid, None)
 
-# ============== OPENAI RESPONSES API ==============
-async def ask_openai(prompt_messages):
+# ============== ANTHROPIC HTTP ==============
+async def ask_claude(messages):
     global tokens_used_today
 
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
     }
 
     payload = {
         "model": MODEL_ID,
-        "input": prompt_messages,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": MAX_TOKENS,
+        "messages": messages,
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            "https://api.openai.com/v1/responses",
+            "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
         )
         r.raise_for_status()
         data = r.json()
 
-    text = data["output_text"]
+    text = data["content"][0]["text"]
     tokens_used_today += estimate_tokens(text)
     return text.strip()
 
@@ -113,12 +115,13 @@ async def process_queue(chat_id, context):
                 session = sessions[chat_id]
 
                 messages = [
-                    {"role": "system", "content": "Ты полезный и краткий ассистент."}
+                    {"role": "user", "content": text}
                 ]
-                messages += session["history"]
-                messages.append({"role": "user", "content": text})
 
-                answer = await ask_openai(messages)
+                if session["history"]:
+                    messages = session["history"] + messages
+
+                answer = await ask_claude(messages)
 
                 session["history"].append({"role": "user", "content": text})
                 session["history"].append({"role": "assistant", "content": answer})
@@ -136,7 +139,7 @@ async def process_queue(chat_id, context):
             except httpx.HTTPStatusError as e:
                 await context.bot.send_message(
                     chat_id,
-                    f"⚠️ OpenAI HTTP {e.response.status_code}\n\n{SIGNATURE}"
+                    f"⚠️ Claude HTTP {e.response.status_code}\n\n{SIGNATURE}"
                 )
             except Exception as e:
                 await context.bot.send_message(
@@ -170,7 +173,7 @@ def main():
         first=60,
     )
 
-    print("✅ AI Bot запущен (Responses API, project key OK)")
+    print("✅ Elyyxs Claude AI Replier запущен")
     app.run_polling()
 
 if __name__ == "__main__":
