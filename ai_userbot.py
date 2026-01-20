@@ -6,14 +6,9 @@ from collections import defaultdict, deque
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# ================= ENV =================
+# ============== ENV ==============
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,30 +17,28 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not BOT_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("❌ Проверь .env файл")
 
-# ================= SETTINGS =================
-MODEL = "gpt-4o-mini"
+# ============== SETTINGS ==============
+MODEL_ID = "gpt-4o-mini"
 MODEL_LABEL = "GPT-4o mini"
-
 SIGNATURE = "by: @elyyxs"
 
-MAX_TOKENS = 400
+MAX_OUTPUT_TOKENS = 400
 MEMORY_LIMIT = 6
 SESSION_TIMEOUT = 30 * 60
 
 DELAY_MIN = 4.5
 DELAY_MAX = 6.5
 
-# 💰 лимит (грубо)
 MAX_TOKENS_PER_DAY = 8000
 tokens_used_today = 0
 last_day = time.strftime("%Y-%m-%d")
 
-# ================= STATE =================
+# ============== STATE ==============
 sessions = {}
 queues = defaultdict(deque)
 locks = defaultdict(asyncio.Lock)
 
-# ================= HELPERS =================
+# ============== HELPERS ==============
 def reset_daily_limit():
     global tokens_used_today, last_day
     today = time.strftime("%Y-%m-%d")
@@ -70,8 +63,8 @@ def cleanup_sessions():
             sessions.pop(cid, None)
             queues.pop(cid, None)
 
-# ================= OPENAI HTTP =================
-async def ask_openai_http(messages):
+# ============== OPENAI RESPONSES API ==============
+async def ask_openai(prompt_messages):
     global tokens_used_today
 
     headers = {
@@ -80,25 +73,25 @@ async def ask_openai_http(messages):
     }
 
     payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": MAX_TOKENS,
+        "model": MODEL_ID,
+        "input": prompt_messages,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
             headers=headers,
             json=payload,
         )
         r.raise_for_status()
         data = r.json()
 
-    content = data["choices"][0]["message"]["content"].strip()
-    tokens_used_today += estimate_tokens(content)
-    return content
+    text = data["output_text"]
+    tokens_used_today += estimate_tokens(text)
+    return text.strip()
 
-# ================= QUEUE =================
+# ============== QUEUE PROCESSOR ==============
 async def process_queue(chat_id, context):
     async with locks[chat_id]:
         while queues[chat_id]:
@@ -112,7 +105,7 @@ async def process_queue(chat_id, context):
                 if tokens_used_today >= MAX_TOKENS_PER_DAY:
                     await context.bot.send_message(
                         chat_id,
-                        "💰 Дневной лимит исчерпан. Попробуй завтра.\n\n" + SIGNATURE
+                        f"💰 Дневной лимит исчерпан\n\n{SIGNATURE}"
                     )
                     continue
 
@@ -120,12 +113,12 @@ async def process_queue(chat_id, context):
                 session = sessions[chat_id]
 
                 messages = [
-                    {"role": "system", "content": "Ты полезный, краткий и точный ассистент."}
+                    {"role": "system", "content": "Ты полезный и краткий ассистент."}
                 ]
                 messages += session["history"]
                 messages.append({"role": "user", "content": text})
 
-                answer = await ask_openai_http(messages)
+                answer = await ask_openai(messages)
 
                 session["history"].append({"role": "user", "content": text})
                 session["history"].append({"role": "assistant", "content": answer})
@@ -143,7 +136,7 @@ async def process_queue(chat_id, context):
             except httpx.HTTPStatusError as e:
                 await context.bot.send_message(
                     chat_id,
-                    f"⚠️ OpenAI HTTP ошибка: {e.response.status_code}\n\n{SIGNATURE}"
+                    f"⚠️ OpenAI HTTP {e.response.status_code}\n\n{SIGNATURE}"
                 )
             except Exception as e:
                 await context.bot.send_message(
@@ -151,7 +144,7 @@ async def process_queue(chat_id, context):
                     f"⚠️ Ошибка: {str(e)}\n\n{SIGNATURE}"
                 )
 
-# ================= HANDLER =================
+# ============== HANDLER ==============
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -166,7 +159,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(queues[chat_id]) == 1:
         asyncio.create_task(process_queue(chat_id, context))
 
-# ================= MAIN =================
+# ============== MAIN ==============
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
@@ -177,7 +170,7 @@ def main():
         first=60,
     )
 
-    print("✅ AI Bot запущен (модель + подпись добавлены)")
+    print("✅ AI Bot запущен (Responses API, project key OK)")
     app.run_polling()
 
 if __name__ == "__main__":
