@@ -13,7 +13,7 @@ from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     MessageHandler,
-    filters
+    filters,
 )
 
 # ================= ENV =================
@@ -23,36 +23,39 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+if not BOT_TOKEN or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
+    raise RuntimeError("❌ Проверь .env — отсутствуют ключи")
+
 openai.api_key = OPENAI_API_KEY
 
 # ================= SETTINGS =================
 AI_TRIGGER = "AI CHAT"
 STOP_TRIGGER = "STOP AI"
 
-DELAY_RANGE = (5.0, 7.0)
+DELAY_RANGE = (5.0, 7.0)   # задержка ответа
 MAX_TOKENS = 400
-TIMEOUT = 30 * 60  # 30 минут
+TIMEOUT = 30 * 60          # 30 минут
 
 # ================= STATE =================
-sessions = {}                  # chat_id -> {model, last_activity}
-queues = defaultdict(deque)    # chat_id -> message queue
+sessions = {}                   # chat_id -> {model, last_activity}
+queues = defaultdict(deque)     # chat_id -> очередь сообщений
 locks = defaultdict(asyncio.Lock)
 
 # ================= OPENAI =================
 def ask_openai(prompt: str) -> str:
-    resp = openai.ChatCompletion.create(
+    response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=MAX_TOKENS
     )
-    return resp.choices[0].message["content"].strip()
+    return response.choices[0].message["content"].strip()
 
 # ================= ANTHROPIC (HTTP) =================
 async def ask_anthropic(prompt: str) -> str:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "content-type": "application/json",
     }
 
     payload = {
@@ -60,14 +63,14 @@ async def ask_anthropic(prompt: str) -> str:
         "max_tokens": MAX_TOKENS,
         "messages": [
             {"role": "user", "content": prompt}
-        ]
+        ],
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
-            json=payload
+            json=payload,
         )
         r.raise_for_status()
         data = r.json()
@@ -78,7 +81,7 @@ def activate_session(chat_id: int) -> str:
     model = random.choice(["openai", "anthropic"])
     sessions[chat_id] = {
         "model": model,
-        "last_activity": time.time()
+        "last_activity": time.time(),
     }
     return model
 
@@ -98,6 +101,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 model = sessions[chat_id]["model"]
+
                 if model == "openai":
                     reply = ask_openai(text)
                 else:
@@ -105,7 +109,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
                 await context.bot.send_message(chat_id, reply)
 
-            except Exception as e:
+            except Exception:
                 await context.bot.send_message(
                     chat_id,
                     "⚠️ Ошибка AI, попробуйте позже"
@@ -121,7 +125,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.message.chat_id
 
-    # STOP AI — всегда приоритет
+    # STOP AI — приоритет
     if text.upper() == STOP_TRIGGER:
         if session_active(chat_id):
             deactivate_session(chat_id)
@@ -140,7 +144,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Обычные сообщения
+    # Обычное сообщение
     if session_active(chat_id):
         sessions[chat_id]["last_activity"] = time.time()
         queues[chat_id].append(text)
@@ -148,24 +152,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(queues[chat_id]) == 1:
             asyncio.create_task(process_queue(chat_id, context))
 
-# ================= CLEANUP =================
-async def cleanup_sessions():
-    while True:
-        now = time.time()
-        for cid in list(sessions.keys()):
-            if now - sessions[cid]["last_activity"] > TIMEOUT:
-                deactivate_session(cid)
-        await asyncio.sleep(60)
+# ================= CLEANUP JOB =================
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    for cid in list(sessions.keys()):
+        if now - sessions[cid]["last_activity"] > TIMEOUT:
+            deactivate_session(cid)
 
 # ================= MAIN =================
-async def main():
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    asyncio.create_task(cleanup_sessions())
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_message)
+    )
+
+    # каждые 60 сек чистим сессии
+    app.job_queue.run_repeating(cleanup_job, interval=60, first=60)
 
     print("✅ Telegram Business AI Bot запущен")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
